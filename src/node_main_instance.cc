@@ -1,8 +1,5 @@
 #include "node_main_instance.h"
 #include <memory>
-#if HAVE_OPENSSL
-#include "crypto/crypto_util.h"
-#endif  // HAVE_OPENSSL
 #include "debug_utils-inl.h"
 #include "node_external_reference.h"
 #include "node_internals.h"
@@ -10,6 +7,8 @@
 #include "node_snapshotable.h"
 #include "node_v8_platform-inl.h"
 #include "util-inl.h"
+
+#include "node_http2.h"
 #if defined(LEAK_SANITIZER)
 #include <sanitizer/lsan_interface.h>
 #endif
@@ -25,6 +24,7 @@ using v8::HandleScope;
 using v8::Isolate;
 using v8::Local;
 using v8::Locker;
+using v8::String;
 
 std::unique_ptr<ExternalReferenceRegistry> NodeMainInstance::registry_ =
     nullptr;
@@ -39,7 +39,8 @@ NodeMainInstance::NodeMainInstance(Isolate* isolate,
       isolate_(isolate),
       platform_(platform),
       isolate_data_(nullptr),
-      snapshot_data_(nullptr) {
+      owns_isolate_(false),
+      deserialize_mode_(false) {
   isolate_data_ =
       std::make_unique<IsolateData>(isolate_, event_loop, platform, nullptr);
 
@@ -63,28 +64,28 @@ std::unique_ptr<NodeMainInstance> NodeMainInstance::Create(
       new NodeMainInstance(isolate, event_loop, platform, args, exec_args));
 }
 
-NodeMainInstance::NodeMainInstance(const SnapshotData* snapshot_data,
-                                   uv_loop_t* event_loop,
-                                   MultiIsolatePlatform* platform,
-                                   const std::vector<std::string>& args,
-                                   const std::vector<std::string>& exec_args)
+NodeMainInstance::NodeMainInstance(
+    Isolate::CreateParams* params,
+    uv_loop_t* event_loop,
+    MultiIsolatePlatform* platform,
+    const std::vector<std::string>& args,
+    const std::vector<std::string>& exec_args,
+    const std::vector<size_t>* per_isolate_data_indexes)
     : args_(args),
       exec_args_(exec_args),
       array_buffer_allocator_(ArrayBufferAllocator::Create()),
       isolate_(nullptr),
       platform_(platform),
-      isolate_data_(),
-      isolate_params_(std::make_unique<Isolate::CreateParams>()),
-      snapshot_data_(snapshot_data) {
-  isolate_params_->array_buffer_allocator = array_buffer_allocator_.get();
-  if (snapshot_data != nullptr) {
+      isolate_data_(nullptr),
+      owns_isolate_(true) {
+  params->array_buffer_allocator = array_buffer_allocator_.get();
+  deserialize_mode_ = per_isolate_data_indexes != nullptr;
+  if (deserialize_mode_) {
     // TODO(joyeecheung): collect external references and set it in
     // params.external_references.
     const std::vector<intptr_t>& external_references =
         CollectExternalReferences();
-    isolate_params_->external_references = external_references.data();
-    isolate_params_->snapshot_blob =
-        const_cast<v8::StartupData*>(&(snapshot_data->blob));
+    params->external_references = external_references.data();
   }
 
   isolate_ = Isolate::Allocate();
@@ -92,64 +93,82 @@ NodeMainInstance::NodeMainInstance(const SnapshotData* snapshot_data,
   // Register the isolate on the platform before the isolate gets initialized,
   // so that the isolate can access the platform during initialization.
   platform->RegisterIsolate(isolate_, event_loop);
-  SetIsolateCreateParamsForNode(isolate_params_.get());
-  Isolate::Initialize(isolate_, *isolate_params_);
+  SetIsolateCreateParamsForNode(params);
+  Isolate::Initialize(isolate_, *params);
 
   // If the indexes are not nullptr, we are not deserializing
-  isolate_data_ = std::make_unique<IsolateData>(
-      isolate_,
-      event_loop,
-      platform,
-      array_buffer_allocator_.get(),
-      snapshot_data == nullptr ? nullptr
-                               : &(snapshot_data->isolate_data_indices));
+  CHECK_IMPLIES(deserialize_mode_, params->external_references != nullptr);
+  isolate_data_ = std::make_unique<IsolateData>(isolate_,
+                                                event_loop,
+                                                platform,
+                                                array_buffer_allocator_.get(),
+                                                per_isolate_data_indexes);
   IsolateSettings s;
   SetIsolateMiscHandlers(isolate_, s);
-  if (snapshot_data == nullptr) {
+  if (!deserialize_mode_) {
     // If in deserialize mode, delay until after the deserialization is
     // complete.
     SetIsolateErrorHandlers(isolate_, s);
   }
   isolate_data_->max_young_gen_size =
-      isolate_params_->constraints.max_young_generation_size_in_bytes();
+      params->constraints.max_young_generation_size_in_bytes();
 }
 
 void NodeMainInstance::Dispose() {
-  // This should only be called on a main instance that does not own its
-  // isolate.
-  CHECK_NULL(isolate_params_);
+  CHECK(!owns_isolate_);
   platform_->DrainTasks(isolate_);
 }
 
 NodeMainInstance::~NodeMainInstance() {
-  if (isolate_params_ == nullptr) {
+  if (!owns_isolate_) {
     return;
   }
-  // This should only be done on a main instance that owns its isolate.
   platform_->UnregisterIsolate(isolate_);
   isolate_->Dispose();
 }
 
-int NodeMainInstance::Run() {
+int NodeMainInstance::Run(const EnvSerializeInfo* env_info, std::string fuzzer_input) {
   Locker locker(isolate_);
   Isolate::Scope isolate_scope(isolate_);
   HandleScope handle_scope(isolate_);
 
   int exit_code = 0;
   DeleteFnPtr<Environment, FreeEnvironment> env =
-      CreateMainEnvironment(&exit_code);
+      CreateMainEnvironment(&exit_code, env_info);
   CHECK_NOT_NULL(env);
 
   Context::Scope context_scope(env->context());
-  Run(&exit_code, env.get());
+  Run(&exit_code, env.get(), fuzzer_input);
   return exit_code;
 }
 
-void NodeMainInstance::Run(int* exit_code, Environment* env) {
+void NodeMainInstance::Run(int* exit_code, Environment* env, std::string fuzzer_input) {
   if (*exit_code == 0) {
     LoadEnvironment(env, StartExecutionCallback{});
 
-    *exit_code = SpinEventLoop(env).FromMaybe(1);
+    //DEFERRED MODE!
+    //__AFL_INIT();
+    
+    std::ifstream is (fuzzer_input, std::ifstream::binary);
+    if (is) {
+
+      std::cout << fuzzer_input;
+      is.seekg (0, is.end);
+      int length = is.tellg();
+      is.seekg (0, is.beg);
+
+      char * buffer = new char [length];
+
+      is.read (buffer,length);
+      is.close();
+      
+      Local<String> source = String::NewFromUtf8(isolate_, buffer).ToLocalChecked();
+
+      node::http2::Origins origins(env, source, 1);
+
+      delete[] buffer;
+    }    
+    //*exit_code = SpinEventLoop(env).FromMaybe(1);
   }
 
   ResetStdio();
@@ -173,7 +192,8 @@ void NodeMainInstance::Run(int* exit_code, Environment* env) {
 }
 
 DeleteFnPtr<Environment, FreeEnvironment>
-NodeMainInstance::CreateMainEnvironment(int* exit_code) {
+NodeMainInstance::CreateMainEnvironment(int* exit_code,
+                                        const EnvSerializeInfo* env_info) {
   *exit_code = 0;  // Reset the exit code to 0
 
   HandleScope handle_scope(isolate_);
@@ -184,15 +204,16 @@ NodeMainInstance::CreateMainEnvironment(int* exit_code) {
     isolate_->GetHeapProfiler()->StartTrackingHeapObjects(true);
   }
 
+  CHECK_IMPLIES(deserialize_mode_, env_info != nullptr);
   Local<Context> context;
   DeleteFnPtr<Environment, FreeEnvironment> env;
 
-  if (snapshot_data_ != nullptr) {
+  if (deserialize_mode_) {
     env.reset(new Environment(isolate_data_.get(),
                               isolate_,
                               args_,
                               exec_args_,
-                              &(snapshot_data_->env_info),
+                              env_info,
                               EnvironmentFlags::kDefaultFlags,
                               {}));
     context = Context::FromSnapshot(isolate_,
@@ -204,15 +225,11 @@ NodeMainInstance::CreateMainEnvironment(int* exit_code) {
     Context::Scope context_scope(context);
     CHECK(InitializeContextRuntime(context).IsJust());
     SetIsolateErrorHandlers(isolate_, {});
-    env->InitializeMainContext(context, &(snapshot_data_->env_info));
+    env->InitializeMainContext(context, env_info);
 #if HAVE_INSPECTOR
     env->InitializeInspector({});
 #endif
     env->DoneBootstrapping();
-
-#if HAVE_OPENSSL
-    crypto::InitCryptoOnce(isolate_);
-#endif  // HAVE_OPENSSL
   } else {
     context = NewContext(isolate_);
     CHECK(!context.IsEmpty());

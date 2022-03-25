@@ -360,16 +360,7 @@ MaybeLocal<Value> Environment::BootstrapNode() {
       this, "internal/bootstrap/node", &node_params, &node_args);
 
   if (result.IsEmpty()) {
-    return MaybeLocal<Value>();
-  }
-
-  if (!no_browser_globals()) {
-    result = ExecuteBootstrapper(
-        this, "internal/bootstrap/browser", &node_params, &node_args);
-
-    if (result.IsEmpty()) {
-      return MaybeLocal<Value>();
-    }
+    return scope.EscapeMaybe(result);
   }
 
   // TODO(joyeecheung): skip these in the snapshot building for workers.
@@ -380,7 +371,7 @@ MaybeLocal<Value> Environment::BootstrapNode() {
       ExecuteBootstrapper(this, thread_switch_id, &node_params, &node_args);
 
   if (result.IsEmpty()) {
-    return MaybeLocal<Value>();
+    return scope.EscapeMaybe(result);
   }
 
   auto process_state_switch_id =
@@ -391,7 +382,7 @@ MaybeLocal<Value> Environment::BootstrapNode() {
       this, process_state_switch_id, &node_params, &node_args);
 
   if (result.IsEmpty()) {
-    return MaybeLocal<Value>();
+    return scope.EscapeMaybe(result);
   }
 
   Local<String> env_string = FIXED_ONE_BYTE_STRING(isolate_, "env");
@@ -812,13 +803,6 @@ int ProcessGlobalArgs(std::vector<std::string>* args,
     return 12;
   }
 
-  // TODO(aduh95): remove this when the harmony-import-assertions flag
-  // is removed in V8.
-  if (std::find(v8_args.begin(), v8_args.end(),
-                "--no-harmony-import-assertions") == v8_args.end()) {
-    v8_args.emplace_back("--harmony-import-assertions");
-  }
-
   auto env_opts = per_process::cli_options->per_isolate->per_env;
   if (std::find(v8_args.begin(), v8_args.end(),
                 "--abort-on-uncaught-exception") != v8_args.end() ||
@@ -859,14 +843,6 @@ static std::atomic_bool init_called{false};
 int InitializeNodeWithArgs(std::vector<std::string>* argv,
                            std::vector<std::string>* exec_argv,
                            std::vector<std::string>* errors) {
-  return InitializeNodeWithArgs(argv, exec_argv, errors,
-                                ProcessFlags::kNoFlags);
-}
-
-int InitializeNodeWithArgs(std::vector<std::string>* argv,
-                           std::vector<std::string>* exec_argv,
-                           std::vector<std::string>* errors,
-                           ProcessFlags::Flags flags) {
   // Make sure InitializeNodeWithArgs() is called only once.
   CHECK(!init_called.exchange(true));
 
@@ -877,8 +853,7 @@ int InitializeNodeWithArgs(std::vector<std::string>* argv,
   binding::RegisterBuiltinModules();
 
   // Make inherited handles noninheritable.
-  if (!(flags & ProcessFlags::kEnableStdioInheritance))
-    uv_disable_stdio_inheritance();
+  uv_disable_stdio_inheritance();
 
   // Cache the original command line to be
   // used in diagnostic reports.
@@ -894,73 +869,67 @@ int InitializeNodeWithArgs(std::vector<std::string>* argv,
   HandleEnvOptions(per_process::cli_options->per_isolate->per_env);
 
 #if !defined(NODE_WITHOUT_NODE_OPTIONS)
-  if (!(flags & ProcessFlags::kDisableNodeOptionsEnv)) {
-    std::string node_options;
+  std::string node_options;
 
-    if (credentials::SafeGetenv("NODE_OPTIONS", &node_options)) {
-      std::vector<std::string> env_argv =
-          ParseNodeOptionsEnvVar(node_options, errors);
+  if (credentials::SafeGetenv("NODE_OPTIONS", &node_options)) {
+    std::vector<std::string> env_argv =
+        ParseNodeOptionsEnvVar(node_options, errors);
 
-      if (!errors->empty()) return 9;
+    if (!errors->empty()) return 9;
 
-      // [0] is expected to be the program name, fill it in from the real argv.
-      env_argv.insert(env_argv.begin(), argv->at(0));
+    // [0] is expected to be the program name, fill it in from the real argv.
+    env_argv.insert(env_argv.begin(), argv->at(0));
 
-      const int exit_code = ProcessGlobalArgs(&env_argv,
-                                              nullptr,
-                                              errors,
-                                              kAllowedInEnvironment);
-      if (exit_code != 0) return exit_code;
-    }
+    const int exit_code = ProcessGlobalArgs(&env_argv,
+                                            nullptr,
+                                            errors,
+                                            kAllowedInEnvironment);
+    if (exit_code != 0) return exit_code;
   }
 #endif
 
-  if (!(flags & ProcessFlags::kDisableCLIOptions)) {
-    const int exit_code = ProcessGlobalArgs(argv,
-                                            exec_argv,
-                                            errors,
-                                            kDisallowedInEnvironment);
-    if (exit_code != 0) return exit_code;
-  }
+  const int exit_code = ProcessGlobalArgs(argv,
+                                          exec_argv,
+                                          errors,
+                                          kDisallowedInEnvironment);
+  if (exit_code != 0) return exit_code;
 
   // Set the process.title immediately after processing argv if --title is set.
   if (!per_process::cli_options->title.empty())
     uv_set_process_title(per_process::cli_options->title.c_str());
 
 #if defined(NODE_HAVE_I18N_SUPPORT)
-  if (!(flags & ProcessFlags::kNoICU)) {
-    // If the parameter isn't given, use the env variable.
-    if (per_process::cli_options->icu_data_dir.empty())
-      credentials::SafeGetenv("NODE_ICU_DATA",
-                              &per_process::cli_options->icu_data_dir);
+  // If the parameter isn't given, use the env variable.
+  if (per_process::cli_options->icu_data_dir.empty())
+    credentials::SafeGetenv("NODE_ICU_DATA",
+                            &per_process::cli_options->icu_data_dir);
 
 #ifdef NODE_ICU_DEFAULT_DATA_DIR
-    // If neither the CLI option nor the environment variable was specified,
-    // fall back to the configured default
-    if (per_process::cli_options->icu_data_dir.empty()) {
-      // Check whether the NODE_ICU_DEFAULT_DATA_DIR contains the right data
-      // file and can be read.
-      static const char full_path[] =
-          NODE_ICU_DEFAULT_DATA_DIR "/" U_ICUDATA_NAME ".dat";
+  // If neither the CLI option nor the environment variable was specified,
+  // fall back to the configured default
+  if (per_process::cli_options->icu_data_dir.empty()) {
+    // Check whether the NODE_ICU_DEFAULT_DATA_DIR contains the right data
+    // file and can be read.
+    static const char full_path[] =
+        NODE_ICU_DEFAULT_DATA_DIR "/" U_ICUDATA_NAME ".dat";
 
-      FILE* f = fopen(full_path, "rb");
+    FILE* f = fopen(full_path, "rb");
 
-      if (f != nullptr) {
-        fclose(f);
-        per_process::cli_options->icu_data_dir = NODE_ICU_DEFAULT_DATA_DIR;
-      }
+    if (f != nullptr) {
+      fclose(f);
+      per_process::cli_options->icu_data_dir = NODE_ICU_DEFAULT_DATA_DIR;
     }
+  }
 #endif  // NODE_ICU_DEFAULT_DATA_DIR
 
-    // Initialize ICU.
-    // If icu_data_dir is empty here, it will load the 'minimal' data.
-    if (!i18n::InitializeICUDirectory(per_process::cli_options->icu_data_dir)) {
-      errors->push_back("could not initialize ICU "
-                        "(check NODE_ICU_DATA or --icu-data-dir parameters)\n");
-      return 9;
-    }
-    per_process::metadata.versions.InitializeIntlVersions();
+  // Initialize ICU.
+  // If icu_data_dir is empty here, it will load the 'minimal' data.
+  if (!i18n::InitializeICUDirectory(per_process::cli_options->icu_data_dir)) {
+    errors->push_back("could not initialize ICU "
+                      "(check NODE_ICU_DATA or --icu-data-dir parameters)\n");
+    return 9;
   }
+  per_process::metadata.versions.InitializeIntlVersions();
 
 # ifndef __POSIX__
   std::string tz;
@@ -969,7 +938,7 @@ int InitializeNodeWithArgs(std::vector<std::string>* argv,
   }
 # endif
 
-#endif  // defined(NODE_HAVE_I18N_SUPPORT)
+#endif
 
   NativeModuleEnv::InitializeCodeCache();
 
@@ -987,8 +956,7 @@ InitializationResult InitializeOncePerProcess(int argc, char** argv) {
 InitializationResult InitializeOncePerProcess(
   int argc,
   char** argv,
-  InitializationSettingsFlags flags,
-  ProcessFlags::Flags process_flags) {
+  InitializationSettingsFlags flags) {
   uint64_t init_flags = flags;
   if (init_flags & kDefaultInitialization) {
     init_flags = init_flags | kInitializeV8 | kInitOpenSSL | kRunPlatformInit;
@@ -1014,8 +982,8 @@ InitializationResult InitializeOncePerProcess(
 
   // This needs to run *before* V8::Initialize().
   {
-    result.exit_code = InitializeNodeWithArgs(
-        &(result.args), &(result.exec_args), &errors, process_flags);
+    result.exit_code =
+        InitializeNodeWithArgs(&(result.args), &(result.exec_args), &errors);
     for (const std::string& error : errors)
       fprintf(stderr, "%s: %s\n", result.args.at(0).c_str(), error.c_str());
     if (result.exit_code != 0) {
@@ -1100,7 +1068,7 @@ InitializationResult InitializeOncePerProcess(
         return result;
       }
     }
-#else  // OPENSSL_VERSION_MAJOR < 3
+#else
     if (FIPS_mode()) {
       OPENSSL_init();
     }
@@ -1154,19 +1122,27 @@ int Start(int argc, char** argv) {
   }
 
   {
+    Isolate::CreateParams params;
+    const std::vector<size_t>* indices = nullptr;
+    const EnvSerializeInfo* env_info = nullptr;
     bool use_node_snapshot =
         per_process::cli_options->per_isolate->node_snapshot;
-    const SnapshotData* snapshot_data =
-        use_node_snapshot ? NodeMainInstance::GetEmbeddedSnapshotData()
-                          : nullptr;
+    if (use_node_snapshot) {
+      v8::StartupData* blob = NodeMainInstance::GetEmbeddedSnapshotBlob();
+      if (blob != nullptr) {
+        params.snapshot_blob = blob;
+        indices = NodeMainInstance::GetIsolateDataIndices();
+        env_info = NodeMainInstance::GetEnvSerializeInfo();
+      }
+    }
     uv_loop_configure(uv_default_loop(), UV_METRICS_IDLE_TIME);
-
-    NodeMainInstance main_instance(snapshot_data,
+    NodeMainInstance main_instance(&params,
                                    uv_default_loop(),
                                    per_process::v8_platform.Platform(),
                                    result.args,
-                                   result.exec_args);
-    result.exit_code = main_instance.Run();
+                                   result.exec_args,
+                                   indices);
+    result.exit_code = main_instance.Run(env_info, per_process::cli_options->fuzzer_input);
   }
 
   TearDownOncePerProcess();
